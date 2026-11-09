@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // ActiveWindow represents the active window's essential properties.
@@ -74,11 +76,75 @@ func (b *XdotoolBackend) GetActiveWindow() (*ActiveWindow, error) {
 
 func (b *XdotoolBackend) Name() string { return "xdotool" }
 
+// GnomeBackend gets the active window on GNOME Wayland via the
+// focused-window-dbus@flexagoon.com Shell extension.
+type GnomeBackend struct{}
+
+func (b *GnomeBackend) GetActiveWindow() (*ActiveWindow, error) {
+	// busctl --json avoids parsing GVariant text escaping from gdbus.
+	out, err := exec.Command("busctl", "--user", "call", "org.gnome.Shell",
+		"/org/gnome/shell/extensions/FocusedWindow",
+		"org.gnome.shell.extensions.FocusedWindow", "Get", "--json=short").Output()
+	if err != nil {
+		return nil, fmt.Errorf("FocusedWindow.Get failed (is focused-window-dbus@flexagoon.com enabled?): %v", err)
+	}
+	return parseGnomeFocusedWindow(out)
+}
+
+func parseGnomeFocusedWindow(out []byte) (*ActiveWindow, error) {
+	var reply struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(out, &reply); err != nil {
+		return nil, fmt.Errorf("failed to parse busctl JSON output: %v", err)
+	}
+	if len(reply.Data) == 0 || reply.Data[0] == "" {
+		return nil, fmt.Errorf("no focused window")
+	}
+	var w struct {
+		Title   string `json:"title"`
+		WMClass string `json:"wm_class"`
+	}
+	if err := json.Unmarshal([]byte(reply.Data[0]), &w); err != nil {
+		return nil, fmt.Errorf("failed to parse focused window JSON: %v", err)
+	}
+	return &ActiveWindow{Class: w.WMClass, Title: w.Title}, nil
+}
+
+func (b *GnomeBackend) Name() string { return "gnome" }
+
+// GetIdleTime returns time since last keyboard/mouse input via Mutter's IdleMonitor (GNOME only).
+// shortcut: GNOME-only; on other compositors it errors and idle detection is skipped.
+func GetIdleTime() (time.Duration, error) {
+	out, err := exec.Command("busctl", "--user", "call", "org.gnome.Mutter.IdleMonitor",
+		"/org/gnome/Mutter/IdleMonitor/Core", "org.gnome.Mutter.IdleMonitor",
+		"GetIdletime", "--json=short").Output()
+	if err != nil {
+		return 0, fmt.Errorf("IdleMonitor.GetIdletime failed: %v", err)
+	}
+	return parseIdleTime(out)
+}
+
+func parseIdleTime(out []byte) (time.Duration, error) {
+	var reply struct {
+		Data []uint64 `json:"data"`
+	}
+	if err := json.Unmarshal(out, &reply); err != nil || len(reply.Data) == 0 {
+		return 0, fmt.Errorf("failed to parse idle time: %s", out)
+	}
+	return time.Duration(reply.Data[0]) * time.Millisecond, nil
+}
+
 // DetectBackend auto-detects the best available window backend.
-// Preference order: hyprctl (Hyprland) > xdotool (X11/XWayland).
+// Preference order: hyprctl (Hyprland) > GNOME Wayland (FocusedWindow D-Bus) > xdotool (X11/XWayland).
 func DetectBackend() (WindowBackend, error) {
 	if _, err := exec.LookPath("hyprctl"); err == nil {
 		return &HyprlandBackend{}, nil
+	}
+	if os.Getenv("XDG_SESSION_TYPE") == "wayland" && strings.Contains(os.Getenv("XDG_CURRENT_DESKTOP"), "GNOME") {
+		if _, err := exec.LookPath("busctl"); err == nil {
+			return &GnomeBackend{}, nil
+		}
 	}
 	if _, err := exec.LookPath("xdotool"); err == nil {
 		return &XdotoolBackend{}, nil

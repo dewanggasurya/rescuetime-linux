@@ -6,7 +6,13 @@ A native Linux activity tracker for [RescueTime](https://www.rescuetime.com) tha
 
 ## Features
 
-- **Multi-Compositor Support** — Hyprland (`hyprctl`) and GNOME/X11 (`xdotool`) with auto-detection
+- **Multi-Compositor Support** — Hyprland (`hyprctl`), GNOME Wayland (`focused-window-dbus@flexagoon.com` extension) and X11 (`xdotool`) with auto-detection
+- **Free-account uploads** — Sends activity through the official client's `/collect` endpoint (no Premium needed)
+- **Idle detection** — On GNOME, stops counting after `idle_threshold` (default 5m) without input
+- **App indicator** — `-tray` shows a status-bar icon with current window, last upload, pause/resume and quit.
+  The icon is the RescueTime logo, loaded at runtime from `~/.config/rescuetime-linux/icon.png` or the installed
+  RescueTime browser extension (not shipped here), with a status dot: grey = no upload yet, green = last upload OK,
+  red = last upload failed. Greyscale = paused.
 - **Smart Session Tracking** — Automatically tracks time spent in each application
 - **Intelligent Merging** — Merges brief window switches to the same app (< 30 seconds)
 - **Session Filtering** — Ignores very short sessions (< 10 seconds) to reduce noise
@@ -55,8 +61,8 @@ Create a `.env` file in the project directory (or copy from `.env.example`):
 # Get from: https://www.rescuetime.com/anapi/manage
 RESCUE_TIME_API_KEY=your_api_key_here
 
-# Optional: Native client API credentials
-# Obtained via the /activate endpoint (see reverse engineering report)
+# Recommended: account key of the official client, enables /collect uploads on free accounts.
+# Copy "account_key" from ~/.config/RescueTime.com/rescuetimed.json
 RESCUE_TIME_ACCOUNT_KEY=your_account_key_here
 RESCUE_TIME_DATA_KEY=your_data_key_here
 ```
@@ -67,6 +73,38 @@ RESCUE_TIME_DATA_KEY=your_data_key_here
 3. Generate or copy your API key
 
 When native credentials (`RESCUE_TIME_ACCOUNT_KEY` / `RESCUE_TIME_DATA_KEY`) are present, the application uses the native client API with automatic fallback to the legacy API on failure.
+
+## Activity upload (`/collect`)
+
+When `RESCUE_TIME_ACCOUNT_KEY` is set, completed sessions are uploaded the same way the official
+Linux client 2.16.5.1 does it (reverse-engineered from `RescueTime::Network::API::upload_activity_log`):
+
+- `POST https://api.rescuetime.com/collect`, `multipart/form-data`, `Accept: application/json`
+- fields: `account_key`, `computer_name`, `os_username`, `client_version`, `os_id=6`, `data_version=2`, `gz=1`, `file_uuid`
+- `file`: `<uuid>.rtg` = gzip of CSV, no header, every field quoted, local time. One row per session, 12 columns
+  (from a file captured from the official client):
+  `"kitty","0.0.0","","<window title>","","2026-11-09 08:07:49","2026-11-09 08:08:33","","","","",""`
+  = app, version, empty, title, empty, started, completed, 5 empty
+- success: HTTP 200 with body `{"c":[0,"RT:ok"]}`. Failed uploads keep the sessions and retry next interval.
+
+Wayland app IDs are renamed before upload to the process names RescueTime already categorizes
+(`com.microsoft.vscode` -> `code`, `brave-origin-beta` -> `brave`, ...; see `defaultAppNames` in `collect.go`).
+Add your own in `config.json`: `"app_names": {"kittytest": "kitty"}`.
+
+**Browser URLs (RescueTime extension):** with `-submit` and an account key, the tracker serves the
+official RescueTime browser extension on `ws://127.0.0.1:16587` (first free port of the extension's list).
+Protocol (from the extension's `lib/RescueTimeWebSocket.js`, protocol_version 1): extension sends
+`{"message_id":0,"account_key":…}`, tracker answers `{"message_id":1,"valid":true,"protocol_version":1}`,
+then the extension sends `{"message_id":2,"url":…}` on every tab change. The URL is uploaded in `.rtg`
+column 5 (`extended_info`), so RescueTime categorizes per site. Only the extension origin
+`chrome-extension://bdakmnplckeopfghnlpocafcepegjeap` (or `moz-extension://`) with the same account key is accepted.
+The extension retries about every 60 s, so the first URL can take up to a minute after start.
+
+**Autostart (GNOME):** `~/.config/autostart/rescuetime-linux.desktop` runs
+`active-window -track -submit -tray` with `Path=` set to this directory so `.env` is found.
+
+`user_client_events` only takes client events such as timezone updates, not activity.
+`offline_time_post` (legacy, `RESCUE_TIME_API_KEY` only) needs RescueTime Premium.
 
 ## Configuration
 
@@ -84,8 +122,7 @@ The application loads configuration from a JSON file at `~/.config/rescuetime-li
   "log_file": "",
   "env_file_path": ".env",
   "persistence_path": "",
-  "legacy_api_endpoint": "https://www.rescuetime.com/anapi/offline_time_post",
-  "native_api_endpoint": "https://api.rescuetime.com/api/resource/user_client_events"
+  "legacy_api_endpoint": "https://www.rescuetime.com/anapi/offline_time_post"
 }
 ```
 
@@ -100,7 +137,6 @@ The application loads configuration from a JSON file at `~/.config/rescuetime-li
 | `env_file_path` | `.env` | Path to environment file with API credentials |
 | `persistence_path` | `""` | Path for session persistence (empty = XDG default) |
 | `legacy_api_endpoint` | `https://www.rescuetime.com/anapi/offline_time_post` | Legacy API endpoint |
-| `native_api_endpoint` | `https://api.rescuetime.com/api/resource/user_client_events` | Native API endpoint |
 
 ## Usage
 
@@ -152,6 +188,7 @@ The application loads configuration from a JSON file at `~/.config/rescuetime-li
 | `-monitor` | `false` | Continuously monitor for window changes |
 | `-track` | `false` | Monitor and track time spent in applications |
 | `-submit` | `false` | Submit activity data to RescueTime API |
+| `-tray` | `false` | Show status-bar app indicator (needs a StatusNotifierItem host, e.g. GNOME AppIndicator extension) |
 | `-config` | `""` | Config file path (default: `~/.config/rescuetime-linux/config.json`) |
 | `-interval` | `""` | Polling interval override (e.g., `100ms`, `1s`) |
 | `-submission-interval` | `""` | Submission interval override (e.g., `15m`, `1h`) |

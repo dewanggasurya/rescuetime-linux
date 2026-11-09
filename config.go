@@ -37,12 +37,14 @@ type Config struct {
 	SubmissionInterval Duration `json:"submission_interval"`
 	MergeThreshold     Duration `json:"merge_threshold"`
 	MinDuration        Duration `json:"min_duration"`
-	LogLevel           string   `json:"log_level"`
-	LogFile            string   `json:"log_file"`
-	EnvFilePath        string   `json:"env_file_path"`
-	PersistencePath    string   `json:"persistence_path"`
-	LegacyAPIEndpoint  string   `json:"legacy_api_endpoint"`
-	NativeAPIEndpoint  string   `json:"native_api_endpoint"`
+	IdleThreshold      Duration `json:"idle_threshold"`
+	// AppNames maps a window class to the app name uploaded to RescueTime, e.g. {"kittytest": "kitty"}
+	AppNames          map[string]string `json:"app_names"`
+	LogLevel          string            `json:"log_level"`
+	LogFile           string            `json:"log_file"`
+	EnvFilePath       string            `json:"env_file_path"`
+	PersistencePath   string            `json:"persistence_path"`
+	LegacyAPIEndpoint string            `json:"legacy_api_endpoint"`
 }
 
 // DefaultConfig returns the default configuration
@@ -52,12 +54,12 @@ func DefaultConfig() Config {
 		SubmissionInterval: Duration{15 * time.Minute},
 		MergeThreshold:     Duration{30 * time.Second},
 		MinDuration:        Duration{10 * time.Second},
+		IdleThreshold:      Duration{5 * time.Minute},
 		LogLevel:           "info",
 		LogFile:            "",
 		EnvFilePath:        ".env",
 		PersistencePath:    "",
 		LegacyAPIEndpoint:  "https://www.rescuetime.com/anapi/offline_time_post",
-		NativeAPIEndpoint:  "https://api.rescuetime.com/api/resource/user_client_events",
 	}
 }
 
@@ -113,16 +115,18 @@ func LoadConfig(path string) (Config, error) {
 
 // ApplyCLIFlags overrides config values with CLI flag values when flags were explicitly set.
 // flagSet maps flag names to their values: "interval", "submission-interval", "log-level", "log-file".
-func (c *Config) ApplyCLIFlags(flags map[string]string) {
-	if v, ok := flags["interval"]; ok {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.PollingInterval = Duration{d}
+// Returns an error for an unparseable or non-positive duration instead of silently ignoring it.
+func (c *Config) ApplyCLIFlags(flags map[string]string) error {
+	for name, dst := range map[string]*Duration{"interval": &c.PollingInterval, "submission-interval": &c.SubmissionInterval} {
+		v, ok := flags[name]
+		if !ok {
+			continue
 		}
-	}
-	if v, ok := flags["submission-interval"]; ok {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.SubmissionInterval = Duration{d}
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("invalid -%s %q: want a positive duration like 1m, 30s, 200ms", name, v)
 		}
+		*dst = Duration{d}
 	}
 	if v, ok := flags["log-level"]; ok {
 		c.LogLevel = v
@@ -130,4 +134,5 @@ func (c *Config) ApplyCLIFlags(flags map[string]string) {
 	if v, ok := flags["log-file"]; ok {
 		c.LogFile = v
 	}
+	return nil
 }

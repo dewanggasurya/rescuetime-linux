@@ -1,0 +1,11 @@
+{
+  "polling_interval": "200ms",
+  "submission_interval": "15m",
+  "merge_threshold": "30s",
+  "min_duration": "10s",
+  "log_level": "info",
+  "log_file": "",
+  "env_file_path": ".env",
+  "persistence_path": "",
+  "legacy_api_endpoint": "https://www.rescuetime.com/anapi/offline_time_post"
+}

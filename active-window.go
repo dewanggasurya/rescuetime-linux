@@ -21,7 +21,7 @@ func formatWindowOutput(windowName, windowClass string) string {
 func printActivitySummary(tracker *ActivityTracker) {
 	fmt.Println("\n=== Activity Summary ===")
 
-	summaries := tracker.GetActivitySummaries()
+	summaries := tracker.GetRunSummaries()
 	if len(summaries) == 0 {
 		fmt.Println("No activities tracked.")
 		return
@@ -47,7 +47,7 @@ func printActivitySummary(tracker *ActivityTracker) {
 
 // printLiveStats prints a compact top-5 apps by duration
 func printLiveStats(tracker *ActivityTracker, startTime time.Time) {
-	summaries := tracker.GetActivitySummaries()
+	summaries := tracker.GetRunSummaries()
 	if len(summaries) == 0 {
 		return
 	}
@@ -88,7 +88,7 @@ func getCurrentWindowInfo(backend WindowBackend) (string, error) {
 }
 
 func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, apiKey string, showStats bool, statsInterval time.Duration) {
-	var lastAppClass, lastWindowTitle string
+	var lastAppClass, lastWindowTitle, lastURL string
 
 	// Create activity tracker and title cleaner
 	tracker := NewActivityTracker(cfg.MergeThreshold.Duration, cfg.MinDuration.Duration)
@@ -113,7 +113,16 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Get initial window info and start the first session
+	// Retry: at login, autostart can run before GNOME Shell loads the focused-window extension.
 	window, err := backend.GetActiveWindow()
+	for i := 0; err != nil && i < 60; i++ {
+		select {
+		case <-sigChan:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		window, err = backend.GetActiveWindow()
+	}
 	if err != nil {
 		slog.Error("failed to get initial window info", "error", err)
 		return
@@ -121,7 +130,8 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 
 	// Start the initial session with cleaned title
 	cleanedTitle := cleaner.Clean(window.Class, window.Title)
-	tracker.StartSession(window.Class, cleanedTitle)
+	lastURL = urlForWindow(window.Class)
+	tracker.StartSession(window.Class, cleanedTitle, lastURL)
 	lastAppClass = window.Class
 	lastWindowTitle = window.Title
 
@@ -153,6 +163,24 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 		slog.Info("live stats enabled", "interval", statsInterval)
 	}
 
+	// Native account key enables /collect uploads (free accounts); otherwise use the legacy API.
+	accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
+	if submitToAPI && accountKey != "" {
+		startExtensionBridge(accountKey)
+	}
+	persistRemaining := func() {
+		if store == nil {
+			return
+		}
+		if remaining := tracker.GetSessions(); len(remaining) > 0 {
+			if err := store.SaveSessions(remaining); err != nil {
+				slog.Warn("failed to save remaining sessions", "error", err)
+			}
+		} else {
+			store.Clear()
+		}
+	}
+
 	for {
 		select {
 		case <-sigChan:
@@ -161,13 +189,15 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 			// End the current session
 			tracker.EndCurrentSession()
 
-			if submitToAPI {
-				// Submit final data then clear persistence
-				summaries := tracker.GetActivitySummaries()
-				submitActivitiesToRescueTime(apiKey, summaries)
-				if store != nil {
-					store.Clear()
+			if submitToAPI && accountKey != "" {
+				collectSubmit(tracker, accountKey)
+				persistRemaining() // keeps sessions whose upload failed for the next run
+			} else if submitToAPI {
+				// Submit final data; keep it on disk for the next run if any upload failed
+				if res := submitActivitiesToRescueTime(apiKey, tracker.GetActivitySummaries()); res.Failed == 0 {
+					tracker.ClearCompletedSessions()
 				}
+				persistRemaining()
 			} else if store != nil {
 				// Save sessions for next run
 				if err := store.SaveSessions(tracker.GetSessions()); err != nil {
@@ -181,11 +211,15 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 
 		case <-submitChan:
 			slog.Debug("submission tick triggered")
-			summaries := tracker.GetActivitySummaries()
-			submitActivitiesToRescueTime(apiKey, summaries)
-
-			// Clear completed sessions after submission
-			tracker.ClearCompletedSessions()
+			if accountKey != "" {
+				collectSubmit(tracker, accountKey)
+				persistRemaining()
+				continue
+			}
+			// Clear completed sessions only when everything was accepted, so failures are retried
+			if res := submitActivitiesToRescueTime(apiKey, tracker.GetActivitySummaries()); res.Failed == 0 {
+				tracker.ClearCompletedSessions()
+			}
 
 			// Save any remaining sessions to disk
 			if store != nil {
@@ -203,6 +237,28 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 			printLiveStats(tracker, startTime)
 
 		case <-pollTicker.C:
+			if tray.isPaused() {
+				if lastAppClass != "" || lastWindowTitle != "" {
+					tracker.EndCurrentSession()
+					slog.Info("tracking paused from tray")
+					tray.setWindow("Paused")
+					lastAppClass, lastWindowTitle, lastURL = "", "", ""
+				}
+				continue
+			}
+
+			if idle, err := GetIdleTime(); err == nil && idle >= cfg.IdleThreshold.Duration {
+				if lastAppClass != "" || lastWindowTitle != "" {
+					// End session at the moment input stopped, not now.
+					tracker.EndCurrentSessionAt(time.Now().Add(-idle))
+					slog.Info("user idle, session ended", "idle", idle.Round(time.Second))
+					fmt.Printf("Idle (no input for %s) [%s]\n", idle.Round(time.Second), time.Now().Format("15:04:05"))
+					tray.setWindow("Idle")
+					lastAppClass, lastWindowTitle, lastURL = "", "", ""
+				}
+				continue
+			}
+
 			window, err := backend.GetActiveWindow()
 			if err != nil {
 				slog.Debug("failed to get active window", "error", err)
@@ -210,22 +266,26 @@ func monitorWindowChanges(backend WindowBackend, cfg Config, submitToAPI bool, a
 			}
 
 			// Check if the application or window title changed
-			if window.Class != lastAppClass || window.Title != lastWindowTitle {
+			// A new tab URL from the extension starts a new session even if the title is unchanged
+			url := urlForWindow(window.Class)
+			if window.Class != lastAppClass || window.Title != lastWindowTitle || url != lastURL {
 				slog.Debug("window changed",
 					"from_app", lastAppClass, "to_app", window.Class,
 					"title", window.Title)
 
 				// Start a new session with cleaned title
 				cleanedTitle := cleaner.Clean(window.Class, window.Title)
-				tracker.StartSession(window.Class, cleanedTitle)
+				tracker.StartSession(window.Class, cleanedTitle, url)
 
 				// Print the change (user-facing)
 				currentInfo := formatWindowOutput(window.Title, window.Class)
 				fmt.Printf("%s [%s]\n", currentInfo, time.Now().Format("15:04:05"))
+				tray.setWindow(window.Class + " — " + cleanedTitle)
 
 				// Update tracking variables
 				lastAppClass = window.Class
 				lastWindowTitle = window.Title
+				lastURL = url
 			}
 		}
 	}
@@ -236,6 +296,7 @@ func main() {
 	monitor := flag.Bool("monitor", false, "Continuously monitor for window changes")
 	track := flag.Bool("track", false, "Monitor and track time spent in applications")
 	submit := flag.Bool("submit", false, "Submit activity data to RescueTime API")
+	trayFlag := flag.Bool("tray", false, "Show a status-bar app indicator (pause/resume, last upload, quit)")
 	configPath := flag.String("config", "", "Config file path (default: ~/.config/rescuetime-linux/config.json)")
 
 	// Stats flags
@@ -270,7 +331,11 @@ func main() {
 			cliFlags["log-file"] = *logFile
 		}
 	})
-	cfg.ApplyCLIFlags(cliFlags)
+	if err := cfg.ApplyCLIFlags(cliFlags); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+	appNameOverrides = cfg.AppNames
 
 	// Set up structured logging (using final resolved config)
 	level := parseLogLevel(cfg.LogLevel)
@@ -320,14 +385,17 @@ func main() {
 
 			// Get API key from environment
 			apiKey = os.Getenv("RESCUE_TIME_API_KEY")
-			if apiKey == "" {
-				slog.Error("RESCUE_TIME_API_KEY not found in environment")
+			if apiKey == "" && os.Getenv("RESCUE_TIME_ACCOUNT_KEY") == "" {
+				slog.Error("neither RESCUE_TIME_ACCOUNT_KEY nor RESCUE_TIME_API_KEY found in environment")
 				os.Exit(1)
 			}
+		}
 
-			monitorWindowChanges(backend, cfg, true, apiKey, *stats, *statsInterval)
+		run := func() { monitorWindowChanges(backend, cfg, *submit, apiKey, *stats, *statsInterval) }
+		if *trayFlag {
+			runWithTray(run)
 		} else {
-			monitorWindowChanges(backend, cfg, false, "", *stats, *statsInterval)
+			run()
 		}
 	} else {
 		// Single execution mode

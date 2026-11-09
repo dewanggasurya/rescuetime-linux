@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"sync"
 	"time"
 )
@@ -11,6 +12,7 @@ type ActivitySession struct {
 	EndTime     time.Time     `json:"end_time"`
 	AppClass    string        `json:"app_class"`
 	WindowTitle string        `json:"window_title"`
+	URL         string        `json:"url,omitempty"` // active browser tab, from the RescueTime extension
 	Duration    time.Duration `json:"duration"`
 	Active      bool          `json:"active"` // true if session is currently ongoing
 }
@@ -30,8 +32,9 @@ type ActivityTracker struct {
 	mu             sync.RWMutex
 	currentSession *ActivitySession
 	sessions       []ActivitySession
-	mergeThreshold time.Duration // merge sessions shorter than this threshold
-	minDuration    time.Duration // ignore sessions shorter than this
+	submitted      []ActivitySession // already uploaded this run; kept only for summaries/stats
+	mergeThreshold time.Duration     // merge sessions shorter than this threshold
+	minDuration    time.Duration     // ignore sessions shorter than this
 }
 
 // NewActivityTracker creates a new activity tracker with the given configuration
@@ -44,7 +47,7 @@ func NewActivityTracker(mergeThreshold, minDuration time.Duration) *ActivityTrac
 }
 
 // StartSession begins tracking a new activity session
-func (at *ActivityTracker) StartSession(appClass, windowTitle string) {
+func (at *ActivityTracker) StartSession(appClass, windowTitle, url string) {
 	at.mu.Lock()
 	defer at.mu.Unlock()
 
@@ -60,6 +63,7 @@ func (at *ActivityTracker) StartSession(appClass, windowTitle string) {
 		StartTime:   now,
 		AppClass:    appClass,
 		WindowTitle: windowTitle,
+		URL:         url,
 		Active:      true,
 	}
 }
@@ -74,16 +78,21 @@ func (at *ActivityTracker) endCurrentSessionUnsafe(endTime time.Time) {
 	at.currentSession.Duration = endTime.Sub(at.currentSession.StartTime)
 	at.currentSession.Active = false
 
-	// Only store sessions that meet minimum duration requirement
-	if at.currentSession.Duration >= at.minDuration {
-		// Check if we should merge with the last session
-		if at.shouldMergeWithLastSession() {
-			at.mergeWithLastSession()
-		} else {
-			// Store the session
-			at.sessions = append(at.sessions, *at.currentSession)
-		}
+	// A piece that continues the previous session (same app and site) is always kept, however short,
+	// so rapid title/URL changes do not lose time. Only short pieces of a different app are dropped.
+	if at.shouldMergeWithLastSession() {
+		at.mergeWithLastSession()
+	} else if at.currentSession.Duration >= at.minDuration {
+		at.sessions = append(at.sessions, *at.currentSession)
 	}
+}
+
+// siteOf returns the host of a URL ("" when there is none), the unit RescueTime categorizes by.
+func siteOf(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		return u.Host
+	}
+	return ""
 }
 
 // EndCurrentSession ends the currently active session
@@ -91,6 +100,13 @@ func (at *ActivityTracker) EndCurrentSession() {
 	at.mu.Lock()
 	defer at.mu.Unlock()
 	at.endCurrentSessionUnsafe(time.Now())
+}
+
+// EndCurrentSessionAt ends the active session at a past time (e.g. when the user went idle)
+func (at *ActivityTracker) EndCurrentSessionAt(endTime time.Time) {
+	at.mu.Lock()
+	defer at.mu.Unlock()
+	at.endCurrentSessionUnsafe(endTime)
 }
 
 // shouldMergeWithLastSession checks if current session should be merged with the previous one
@@ -103,6 +119,10 @@ func (at *ActivityTracker) shouldMergeWithLastSession() bool {
 
 	// Can only merge sessions of the same application
 	if lastSession.AppClass != at.currentSession.AppClass {
+		return false
+	}
+	// Different sites in the same browser are different RescueTime activities
+	if siteOf(lastSession.URL) != siteOf(at.currentSession.URL) {
 		return false
 	}
 
@@ -123,19 +143,31 @@ func (at *ActivityTracker) mergeWithLastSession() {
 	lastSession.EndTime = at.currentSession.EndTime
 	lastSession.Duration = lastSession.EndTime.Sub(lastSession.StartTime)
 
-	// Use the most recent window title
+	// Use the most recent window title and URL
 	lastSession.WindowTitle = at.currentSession.WindowTitle
+	lastSession.URL = at.currentSession.URL
 }
 
-// GetActivitySummaries aggregates sessions by application class
+// GetActivitySummaries aggregates not-yet-submitted sessions by application class
 func (at *ActivityTracker) GetActivitySummaries() map[string]ActivitySummary {
 	at.mu.RLock()
 	defer at.mu.RUnlock()
+	return at.summarizeUnsafe(at.sessions)
+}
 
+// GetRunSummaries aggregates every session of this run, including already-submitted ones (display only).
+func (at *ActivityTracker) GetRunSummaries() map[string]ActivitySummary {
+	at.mu.RLock()
+	defer at.mu.RUnlock()
+	return at.summarizeUnsafe(append(append([]ActivitySession{}, at.submitted...), at.sessions...))
+}
+
+// summarizeUnsafe aggregates sessions plus the current one (must be called with lock held)
+func (at *ActivityTracker) summarizeUnsafe(sessions []ActivitySession) map[string]ActivitySummary {
 	summaries := make(map[string]ActivitySummary)
 
 	// Process all completed sessions
-	for _, session := range at.sessions {
+	for _, session := range sessions {
 		key := session.AppClass
 		summary, exists := summaries[key]
 
@@ -199,7 +231,8 @@ func (at *ActivityTracker) ClearCompletedSessions() {
 	at.mu.Lock()
 	defer at.mu.Unlock()
 
-	// Clear all stored sessions but keep the current active one
+	// Clear all stored sessions but keep the current active one; remember them for the run summary
+	at.submitted = append(at.submitted, at.sessions...)
 	at.sessions = make([]ActivitySession, 0)
 }
 

@@ -22,20 +22,6 @@ type RescueTimePayload struct {
 	ActivityDetails string `json:"activity_details"` // window title/details
 }
 
-// UserClientEventPayload represents the native RescueTime user_client_events API format
-type UserClientEventPayload struct {
-	UserClientEvent UserClientEvent `json:"user_client_event"`
-}
-
-// UserClientEvent represents a single activity tracking event
-type UserClientEvent struct {
-	EventDescription string `json:"event_description"` // application class
-	StartTime        string `json:"start_time"`        // RFC 3339 format: 2025-09-30T12:00:00Z
-	EndTime          string `json:"end_time"`          // RFC 3339 format: 2025-09-30T12:01:00Z
-	WindowTitle      string `json:"window_title"`      // window title
-	Application      string `json:"application"`       // application class (redundant with event_description)
-}
-
 // ActivationRequest represents the payload for the /activate endpoint
 type ActivationRequest struct {
 	Email    string `json:"email"`
@@ -212,26 +198,6 @@ func summaryToPayload(summary ActivitySummary) RescueTimePayload {
 	}
 }
 
-// summaryToUserClientEvent converts an ActivitySummary to UserClientEventPayload format
-func summaryToUserClientEvent(summary ActivitySummary) UserClientEventPayload {
-	// Calculate end time: start time + total duration
-	endTime := summary.FirstSeen.Add(summary.TotalDuration)
-
-	// Format timestamps in RFC 3339 (ISO 8601) format with UTC timezone
-	startTimeFormatted := summary.FirstSeen.UTC().Format(time.RFC3339)
-	endTimeFormatted := endTime.UTC().Format(time.RFC3339)
-
-	return UserClientEventPayload{
-		UserClientEvent: UserClientEvent{
-			EventDescription: summary.AppClass,
-			StartTime:        startTimeFormatted,
-			EndTime:          endTimeFormatted,
-			WindowTitle:      summary.ActivityDetails,
-			Application:      summary.AppClass,
-		},
-	}
-}
-
 // submitToRescueTime submits activity data to RescueTime API with retry logic (legacy offline time API)
 func submitToRescueTime(apiKey string, payload RescueTimePayload) error {
 	const maxRetries = 3
@@ -294,142 +260,18 @@ func submitToRescueTime(apiKey string, payload RescueTimePayload) error {
 	return fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
 }
 
-// submitUserClientEvent submits activity data to native RescueTime user_client_events API
-func submitUserClientEvent(apiKey string, payload UserClientEventPayload) error {
-	const maxRetries = 3
-	const baseDelay = 1 * time.Second
-
-	var lastErr error
-	var tryBearerAuth bool
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			delay := baseDelay * time.Duration(math.Pow(2, float64(attempt-1)))
-			slog.Debug("retrying native API submission",
-				"delay", delay, "attempt", attempt+1, "max_attempts", maxRetries)
-			time.Sleep(delay)
-		}
-
-		// Convert payload to JSON
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			return fmt.Errorf("failed to marshal payload: %v", err)
-		}
-
-		var req *http.Request
-
-		// Try Bearer token auth if query param auth failed with 401
-		if tryBearerAuth {
-			url := "https://api.rescuetime.com/api/resource/user_client_events"
-			req, err = http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-			if err != nil {
-				lastErr = fmt.Errorf("failed to create request: %v", err)
-				continue
-			}
-			dataKey := os.Getenv("RESCUE_TIME_DATA_KEY")
-			if dataKey == "" {
-				dataKey = apiKey
-			}
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", dataKey))
-
-			accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
-			if accountKey != "" {
-				req.URL.RawQuery = fmt.Sprintf("key=%s", accountKey)
-			}
-		} else {
-			authKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
-			if authKey == "" {
-				authKey = apiKey
-			}
-			url := fmt.Sprintf("https://api.rescuetime.com/api/resource/user_client_events?key=%s", authKey)
-			req, err = http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-			if err != nil {
-				lastErr = fmt.Errorf("failed to create request: %v", err)
-				continue
-			}
-		}
-
-		// Set headers matching the official app
-		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		req.Header.Set("User-Agent", "RescueTime/2.16.5.1 (Linux)")
-
-		// Send request
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("request failed: %v", err)
-			continue
-		}
-
-		// Read response body
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		// Check response status
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			authMethod := "query parameter"
-			if tryBearerAuth {
-				authMethod = "Bearer token"
-			}
-			slog.Info("submitted to RescueTime (native)",
-				"auth", authMethod,
-				"app", payload.UserClientEvent.Application,
-				"start", payload.UserClientEvent.StartTime,
-				"end", payload.UserClientEvent.EndTime)
-			return nil
-		}
-
-		lastErr = fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
-
-		// If we got 401 with query param auth, try Bearer token auth next
-		if resp.StatusCode == 401 && !tryBearerAuth {
-			slog.Warn("query parameter auth failed, trying Bearer token",
-				"status", resp.StatusCode)
-			tryBearerAuth = true
-			continue
-		}
-
-		// Don't retry on other client errors (4xx)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return lastErr
-		}
-	}
-
-	return fmt.Errorf("failed after %d attempts: %v", maxRetries, lastErr)
-}
-
 // SubmissionResult holds the outcome of a batch submission
 type SubmissionResult struct {
-	Succeeded      int
-	Failed         int
-	NativeSuccess  int
-	LegacyFallback int
-	Errors         []error
+	Succeeded int
+	Failed    int
+	Errors    []error
 }
 
-// submissionItem holds the result of a single activity submission
-type submissionItem struct {
-	err      error
-	native   bool
-	fallback bool
-}
-
-// submitActivitiesToRescueTime submits all activity summaries to RescueTime
-// using bounded concurrency (3 goroutines). Attempts native API first if
-// credentials are available, falls back to legacy API.
+// submitActivitiesToRescueTime submits activity summaries to the legacy offline_time_post API
+// (RescueTime Premium only) using bounded concurrency (3 goroutines).
+// Free accounts use the /collect upload in collect.go instead.
 func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySummary) SubmissionResult {
 	result := SubmissionResult{}
-
-	if len(summaries) == 0 {
-		slog.Debug("no activities to submit")
-		return result
-	}
-
-	// Check if we have native API credentials
-	dataKey := os.Getenv("RESCUE_TIME_DATA_KEY")
-	accountKey := os.Getenv("RESCUE_TIME_ACCOUNT_KEY")
-	hasNativeCredentials := dataKey != "" || accountKey != ""
 
 	// Filter to submittable activities (>= 1 minute)
 	var toSubmit []ActivitySummary
@@ -441,76 +283,33 @@ func submitActivitiesToRescueTime(apiKey string, summaries map[string]ActivitySu
 		}
 		toSubmit = append(toSubmit, summary)
 	}
-
 	if len(toSubmit) == 0 {
 		slog.Debug("no activities above minimum duration")
 		return result
 	}
+	slog.Info("starting submission", "activity_count", len(toSubmit))
 
-	slog.Info("starting submission", "activity_count", len(toSubmit),
-		"native_credentials", hasNativeCredentials)
-
-	// Bounded concurrency with semaphore channel
 	const maxConcurrent = 3
 	sem := make(chan struct{}, maxConcurrent)
-	results := make(chan submissionItem, len(toSubmit))
-
+	errs := make(chan error, len(toSubmit))
 	for _, summary := range toSubmit {
 		sem <- struct{}{} // acquire
 		go func(s ActivitySummary) {
 			defer func() { <-sem }() // release
-
-			item := submissionItem{}
-
-			if hasNativeCredentials {
-				slog.Debug("trying native API", "app", s.AppClass)
-				payload := summaryToUserClientEvent(s)
-				err := submitUserClientEvent(apiKey, payload)
-
-				if err != nil {
-					slog.Warn("native API failed, trying legacy fallback",
-						"app", s.AppClass, "error", err)
-					legacyPayload := summaryToPayload(s)
-					err = submitToRescueTime(apiKey, legacyPayload)
-					if err == nil {
-						item.fallback = true
-					} else {
-						item.err = err
-					}
-				} else {
-					item.native = true
-				}
-			} else {
-				payload := summaryToPayload(s)
-				if err := submitToRescueTime(apiKey, payload); err != nil {
-					item.err = err
-				}
-			}
-
-			results <- item
+			errs <- submitToRescueTime(apiKey, summaryToPayload(s))
 		}(summary)
 	}
 
-	// Collect results
 	for range len(toSubmit) {
-		item := <-results
-		if item.err != nil {
+		if err := <-errs; err != nil {
+			slog.Warn("submission failed", "error", err)
 			result.Failed++
-			result.Errors = append(result.Errors, item.err)
+			result.Errors = append(result.Errors, err)
 		} else {
 			result.Succeeded++
-			if item.native {
-				result.NativeSuccess++
-			}
-			if item.fallback {
-				result.LegacyFallback++
-			}
 		}
 	}
 
-	slog.Info("submission complete",
-		"succeeded", result.Succeeded, "failed", result.Failed,
-		"native", result.NativeSuccess, "legacy_fallback", result.LegacyFallback)
-
+	slog.Info("submission complete", "succeeded", result.Succeeded, "failed", result.Failed)
 	return result
 }

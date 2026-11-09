@@ -1,6 +1,8 @@
 .idea/
 http-client.env.json
 active-window
+rescuetime-linux
 .env
 *.log
 sessions.json
+.env.bak

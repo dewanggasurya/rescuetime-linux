@@ -66,8 +66,7 @@ Precedence: defaults < config file < CLI flags < env vars (secrets only)
   "log_file": "",
   "env_file_path": ".env",
   "persistence_path": "",
-  "legacy_api_endpoint": "https://www.rescuetime.com/anapi/offline_time_post",
-  "native_api_endpoint": "https://api.rescuetime.com/api/resource/user_client_events"
+  "legacy_api_endpoint": "https://www.rescuetime.com/anapi/offline_time_post"
 }
 ```
 
@@ -106,11 +105,13 @@ Multi-file Go application (`package main`) with these source files:
 - Handles SIGINT/SIGTERM for graceful shutdown with final data submission
 - Optional live stats display (top-5 apps by duration)
 
-### API Integration (dual-mode)
-1. **Native API** (preferred when credentials available): `POST https://api.rescuetime.com/api/resource/user_client_events` with RFC 3339 timestamps
-2. **Legacy API** (fallback): `POST https://www.rescuetime.com/anapi/offline_time_post` with `YYYY-MM-DD HH:MM:SS` format
+### API Integration
+1. **`/collect`** (used when `RESCUE_TIME_ACCOUNT_KEY` is set; works on free accounts): gzipped CSV `.rtg` upload, see `collect.go` and README "Activity upload". Sessions are cleared only after `RT:ok`.
+2. **Legacy API** (fallback, Premium only): `POST https://www.rescuetime.com/anapi/offline_time_post` with `YYYY-MM-DD HH:MM:SS` format
+- `user_client_events` is NOT an activity endpoint (official client uses it for timezone events only); that code path was removed.
 
-Both use exponential backoff retry (3 attempts: 1s, 2s, 4s).
+`/collect` retries a failed upload on the next submission tick; legacy uses exponential backoff (3 attempts: 1s, 2s, 4s). Both clear sessions only after success.
+- Sessions: a piece continuing the same app and site (URL host) is merged however short; short pieces of other apps (< `min_duration`) are dropped.
 
 ## Testing
 
